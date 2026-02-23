@@ -1,3 +1,8 @@
+# runner.py
+# Single-file bot: Polymarket (CBB + NBA) + Kalshi (Politics keyword scan)
+# Alerts: entries + scale updates (TP/SL/TRAIL/TIME) + daily recap
+# Kalshi: includes recommended LIMIT entry price + suggested contract size + suggested TP/SL limits (recommendations only)
+
 import json
 import os
 import re
@@ -35,8 +40,10 @@ SCAN_SEC = int(os.getenv("SCAN_SEC", "60"))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "15"))
 MAX_SLUGS_PER_LEAGUE = int(os.getenv("MAX_SLUGS_PER_LEAGUE", "80"))
 
+# Heartbeat so you know worker is still alive
 HEARTBEAT_MIN = int(os.getenv("HEARTBEAT_MIN", "30"))
 
+# Optional bankroll sizing output
 BANKROLL_USD = float(os.getenv("BANKROLL_USD", "0"))
 
 # =========================
@@ -50,7 +57,7 @@ GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 
 USER_AGENT = os.getenv(
     "USER_AGENT",
-    "Mozilla/5.0 (compatible; PolyKalshiEdgeBot/1.3; +https://polymarket.com)",
+    "Mozilla/5.0 (compatible; PolyKalshiEdgeBot/1.4; +https://polymarket.com)",
 )
 HEADERS = {"User-Agent": USER_AGENT}
 
@@ -65,10 +72,10 @@ KALSHI_MIN_MOVE_CENTS = float(os.getenv("KALSHI_MIN_MOVE_CENTS", "2"))
 KALSHI_MIN_VOLUME = float(os.getenv("KALSHI_MIN_VOLUME", "5000"))
 KALSHI_COOLDOWN_SEC = int(os.getenv("KALSHI_COOLDOWN_SEC", "1800"))
 
-# Limit entry style for Kalshi:
+# Kalshi limit entry style:
 # patient: bid only
-# balanced: bid + 1c (capped at ask)
-# aggressive: ask (or last price if no ask)
+# balanced: bid + 1c capped at ask
+# aggressive: take ask
 KALSHI_LIMIT_STYLE = os.getenv("KALSHI_LIMIT_STYLE", "balanced").strip().lower()
 
 _kw_raw = os.getenv(
@@ -78,7 +85,7 @@ _kw_raw = os.getenv(
 KALSHI_KEYWORDS = [k.strip().lower() for k in _kw_raw.split(",") if k.strip()]
 
 # =========================
-# Sports tuning (separate)
+# Sports tuning
 # =========================
 LEAGUE_CFG = {
     "CBB": {
@@ -106,7 +113,7 @@ LEAGUE_CFG = {
 }
 
 # =========================
-# Guardrails + exits
+# Guardrails + exits (used for both Poly and Kalshi)
 # =========================
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.05"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "0.95"))
@@ -119,6 +126,7 @@ TRAIL_START_CENTS = float(os.getenv("TRAIL_START_CENTS", "4"))
 TRAIL_GAP_CENTS = float(os.getenv("TRAIL_GAP_CENTS", "2"))
 TIME_STOP_MIN = float(os.getenv("TIME_STOP_MIN", "20"))
 
+# Recap time (server local time)
 RECAP_HOUR_LOCAL = int(os.getenv("RECAP_HOUR_LOCAL", "23"))
 RECAP_MIN_LOCAL = int(os.getenv("RECAP_MIN_LOCAL", "59"))
 
@@ -148,6 +156,7 @@ def market_link(slug: str) -> str:
     return f"https://polymarket.com/market/{slug}"
 
 def notify(text: str) -> None:
+    # Discord
     if DISCORD_WEBHOOK:
         try:
             r = requests.post(DISCORD_WEBHOOK, json={"content": text}, timeout=HTTP_TIMEOUT)
@@ -158,6 +167,7 @@ def notify(text: str) -> None:
     else:
         print(text)
 
+    # Telegram
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -169,12 +179,16 @@ def notify(text: str) -> None:
             print("Telegram send failed:", e)
 
 def kelly_fraction_from_conf(conf: float) -> float:
+    # Practical, capped
     x = max(0.0, conf - 5.5)
     frac = min(0.04, (x / 4.0) * 0.035)
     return frac
 
 def in_guardrails(p: float) -> bool:
     return MIN_PRICE <= p <= MAX_PRICE
+
+def clamp_cents(x: float) -> float:
+    return max(1.0, min(99.0, float(x)))
 
 # =========================
 # State
@@ -342,7 +356,7 @@ def log_alert(source: str, league: str, ident: str, outcome: str, price: float, 
         STATE["alerts_log"] = STATE["alerts_log"][-2000:]
 
 # =========================
-# Polymarket Sports WS
+# Polymarket Sports WebSocket
 # =========================
 WS_STATE: Dict[str, Dict[str, Any]] = {}
 WS_LAST_TS: Optional[int] = None
@@ -698,6 +712,7 @@ def kalshi_best_bid_ask(orderbook: Dict[str, Any]) -> Tuple[Optional[float], Opt
     best_bid = None
     best_ask = None
 
+    # Be defensive. Kalshi schema can vary by endpoint version.
     for k in ("yes", "yes_orders", "yesOrderBook", "yes_orderbook"):
         v = ob.get(k)
         if isinstance(v, dict):
@@ -727,11 +742,9 @@ def kalshi_recommended_limit(yes_c: float, best_bid: Optional[float], best_ask: 
             return float(best_bid), "balanced: tight market"
         return float(min(best_ask, best_bid + 1.0)), "balanced: bid+1c capped at ask"
 
-    # fallback if orderbook not usable
     if style == "aggressive":
-        return float(max(1.0, yes_c)), "aggressive: no book, using last"
-    # patient or balanced fallback
-    return float(max(1.0, yes_c - 1.0)), "no book, patient limit 1c below last"
+        return float(clamp_cents(yes_c)), "aggressive: no book, using last"
+    return float(clamp_cents(yes_c - 1.0)), "no book: patient limit 1c below last"
 
 def kalshi_contracts_for_stake(stake_usd: float, limit_cents: float) -> int:
     if limit_cents <= 0:
@@ -754,21 +767,49 @@ def kalshi_confidence(move_snaps_c: float, volume: float) -> float:
         base += 0.3
     return max(1.0, min(10.0, base))
 
-def kalshi_alert_message(title: str, ticker: str, yes_c: float, move_snaps_c: float, volume: float, best_bid: Optional[float], best_ask: Optional[float], conf: float) -> str:
+def kalshi_tp_sl_recommendations(entry_limit_c: float) -> Tuple[float, float, float]:
+    """
+    Recommendations in cents for limit orders on the YES contract after entry.
+    TP1 and TP2 are sell limits above entry, SL is risk stop reference below entry.
+    """
+    tp1 = clamp_cents(entry_limit_c + TP1_CENTS)
+    tp2 = clamp_cents(entry_limit_c + TP2_CENTS)
+    sl = clamp_cents(entry_limit_c - SL_CENTS)
+    return tp1, tp2, sl
+
+def kalshi_alert_message(
+    title: str,
+    ticker: str,
+    yes_c: float,
+    move_snaps_c: float,
+    volume: float,
+    best_bid: Optional[float],
+    best_ask: Optional[float],
+    conf: float,
+) -> str:
     move_emoji = "📈" if move_snaps_c > 0 else "📉"
 
-    limit_price, limit_note = kalshi_recommended_limit(yes_c, best_bid, best_ask)
+    entry_limit_c, entry_note = kalshi_recommended_limit(yes_c, best_bid, best_ask)
+    tp1_c, tp2_c, sl_c = kalshi_tp_sl_recommendations(entry_limit_c)
 
     sizing_txt = ""
     if BANKROLL_USD > 0:
         frac = kelly_fraction_from_conf(conf)
         stake = max(0.0, BANKROLL_USD * frac)
-        contracts = kalshi_contracts_for_stake(stake, limit_price)
-        sizing_txt = f"\n💵 Limit buy: {limit_price:.0f}¢ | Size: ~${stake:.2f} ≈ {contracts} contracts"
+        contracts = kalshi_contracts_for_stake(stake, entry_limit_c)
+        sizing_txt = f"\n💵 Limit buy: {entry_limit_c:.0f}¢ | Size: ~${stake:.2f} ≈ {contracts} contracts"
 
     bidask_txt = ""
     if best_bid is not None or best_ask is not None:
         bidask_txt = f"\n↔️ YES bid/ask: {best_bid if best_bid is not None else 'n/a'}¢ / {best_ask if best_ask is not None else 'n/a'}¢"
+
+    # TP/SL are recommendations only (Kalshi allows limit orders, but bot does not place orders)
+    plan_txt = (
+        f"\n🧾 Plan (recommended):"
+        f"\n   TP1 sell limit: {tp1_c:.0f}¢ (scale partial)"
+        f"\n   TP2 sell limit: {tp2_c:.0f}¢ (scale more)"
+        f"\n   Risk stop ref: {sl_c:.0f}¢ (cut if fades)"
+    )
 
     return (
         f"{prefix_ping()}🏛️ {BOT_NAME} KALSHI POLITICS\n"
@@ -776,8 +817,9 @@ def kalshi_alert_message(title: str, ticker: str, yes_c: float, move_snaps_c: fl
         f"YES: {yes_c:.0f}¢  {move_emoji} Move: {move_snaps_c:+.0f}¢  Vol: {int(volume):,}\n"
         f"🧠 Confidence: {conf:.1f}/10"
         f"{bidask_txt}"
-        f"\n🎯 Limit: {limit_price:.0f}¢ ({limit_note})"
+        f"\n🎯 Entry limit: {entry_limit_c:.0f}¢ ({entry_note})"
         f"{sizing_txt}"
+        f"{plan_txt}"
         f"\n🔎 Ticker: {ticker}"
     )
 
@@ -807,7 +849,6 @@ def run_daily_recap_if_time() -> None:
     sports_wins = 0
     sports_losses = 0
 
-    kalshi_alerts = 0
     kalshi_mtm_sum = 0.0
     kalshi_mtm_n = 0
 
@@ -831,7 +872,6 @@ def run_daily_recap_if_time() -> None:
                     sports_losses += 1
 
         if src == "KALSHI":
-            kalshi_alerts += 1
             ticker = str(a.get("ident"))
             entry_c = float(a.get("price", 0.0))
             cur_c = STATE.get("kalshi_snapshot", {}).get(ticker)
@@ -873,7 +913,7 @@ def main():
                         f"KalshiStyle={KALSHI_LIMIT_STYLE}"
                     )
 
-            # Recap
+            # Recap check
             run_daily_recap_if_time()
 
             # =========================
@@ -976,7 +1016,7 @@ def main():
                                         notify(msg)
                                         log_alert("POLY", league, slug, team, mid, conf, "SCOUT", "pregame-momentum")
 
-                            # Entry displacement
+                            # Entry displacement (tick move)
                             tick_move = mid - pprev
                             if abs(tick_move) >= float(cfg["min_move"]):
                                 conf = poly_confidence(league, move, liq, spread_c, is_live)
@@ -988,7 +1028,7 @@ def main():
                                     log_alert("POLY", league, slug, team, mid, conf, "ENTRY", "displacement")
                                     pos_open(key, mid)
 
-                            # Exits
+                            # Exit updates
                             if key in STATE["positions"]:
                                 pos_update_peak(key, mid)
                                 sig = exit_signal(key, mid)
@@ -1071,20 +1111,28 @@ def main():
                                     alerts_sent += 1
                                     pos_open(key, yes_c)
 
-                            # Exits
+                            # Exit updates (price based)
                             if key in STATE["positions"]:
-                                pos_update_peak(key, yes_c)
-                                sig = exit_signal(key, yes_c)
+                                pos_update_peak(key, yes_c / 100.0)  # treat peak tracking in dollars-like for trailing
+                                # exit_signal expects "dollar" prices for cents_diff math
+                                # convert cents to dollars for exit logic
+                                sig = exit_signal(key, yes_c / 100.0)
                                 if sig:
                                     action, reason = sig
-                                    entry = float(STATE["positions"][key]["entry"])
-                                    pnl_c = yes_c - entry
+                                    entry_d = float(STATE["positions"][key]["entry"])
+                                    entry_c = entry_d * 100.0
+                                    pnl_c = yes_c - entry_c
                                     emoji = "✅" if pnl_c >= 0 else "⚠️"
+
+                                    entry_limit_c, _ = kalshi_recommended_limit(yes_c, None, None)
+                                    tp1_c, tp2_c, sl_c = kalshi_tp_sl_recommendations(entry_limit_c)
+
                                     upd = (
                                         f"{prefix_ping()}{emoji} {BOT_NAME} KALSHI SCALE UPDATE\n"
                                         f"🗳️ {title}\n"
-                                        f"Entry: {entry:.0f}¢ | Now: {yes_c:.0f}¢ | PnL: {pnl_c:+.0f}¢\n"
+                                        f"Entry ref: {entry_c:.0f}¢ | Now: {yes_c:.0f}¢ | PnL: {pnl_c:+.0f}¢\n"
                                         f"Action: {action} | {reason}\n"
+                                        f"Plan refs: TP1 {tp1_c:.0f}¢ | TP2 {tp2_c:.0f}¢ | Stop ref {sl_c:.0f}¢\n"
                                         f"🔎 Ticker: {ticker}"
                                     )
                                     notify(upd)
