@@ -1,4 +1,4 @@
 requests
-websockets
 beautifulsoup4
-python-dotenv
+lxml
+websocket-client
