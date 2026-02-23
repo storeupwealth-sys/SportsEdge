@@ -1,1 +1,1 @@
-worker: python runner.py
+worker: python agent.py
