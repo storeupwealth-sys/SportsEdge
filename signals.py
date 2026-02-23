@@ -1,3 +1,13 @@
+# signals.py
+
+# How many price snapshots we require before we start scoring signals
+MIN_SNAPS = int(__import__("os").environ.get("MIN_SNAPS", "20"))
+
+# Safety: minimum edge to trigger an alert (ex: 0.03 = 3%)
+MIN_EDGE = float(__import__("os").environ.get("MIN_EDGE", "0.03"))
+
+# How long to wait before alerting the same game again (seconds)
+ALERT_COOLDOWN_SEC = int(__import__("os").environ.get("ALERT_COOLDOWN_SEC", "900"))
 import time
 
 COOLDOWN_SECONDS = 120
