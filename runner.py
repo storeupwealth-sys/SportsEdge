@@ -1,13 +1,17 @@
 # runner.py
-# Polymarket Sports Edge Bot (CBB + NBA) - single file, self contained
-# Features:
-# - Watches CBB and NBA (live + upcoming)
-# - Pulls slugs from Polymarket games pages + Sports WebSocket
-# - Pulls prices from Gamma API (bestAsk/bestBid/outcomePrices)
+# God AI Predict Bot (Polymarket) - CBB + NBA - single file
+# No Odds API. Polymarket only.
+#
+# What it does:
+# - Watches NBA + CBB markets
+# - Uses Polymarket Sports WebSocket for live status + score
+# - Uses Gamma API for market prices (bestAsk/bestBid/outcomePrices) + liquidity
 # - Sends Discord + optional Telegram alerts
-# - Separate tuning per league: MIN_SNAPS, MIN_MOVE, cooldowns
-# - Exit management: TP1, TP2, SL, trailing, time stop
-# - Persists state to state.json so it survives restarts
+# - Pregame "scan ahead" alerts (momentum + opening scalp style)
+# - Live alerts + optional late-game-only filter (2H/4Q)
+# - Entry alerts + exits (TP1/TP2/SL/trailing/time stop)
+# - Kelly-style sizing suggestion from confidence + BANKROLL_USD
+# - Daily recap based on finished games (when WS provides ended status + score)
 
 import json
 import os
@@ -17,119 +21,123 @@ import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from bs4 import BeautifulSoup
 from websocket import WebSocketApp
 
-# =========================================================
-# PUT YOUR KEYS HERE (or use Railway Variables)
-# =========================================================
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()  # recommended to set in Railway
+# =========================
+# REQUIRED (set in Railway)
+# =========================
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
+
+# Optional
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 BOT_NAME = os.getenv("BOT_NAME", "God AI Predict Bot").strip()
+PING_EVERYONE = os.getenv("PING_EVERYONE", "1").strip() == "1"
 
-# =========================================================
-# League pages
-# =========================================================
+# =========================
+# Behavior toggles
+# =========================
+ENABLE_PREGAME_ALERTS = os.getenv("ENABLE_PREGAME_ALERTS", "1").strip() == "1"
+ENABLE_LIVE_ALERTS = os.getenv("ENABLE_LIVE_ALERTS", "1").strip() == "1"
+
+# If enabled, only alert live games during 2H/4Q (stronger window)
+LIVE_LATE_GAME_ONLY = os.getenv("LIVE_LATE_GAME_ONLY", "0").strip() == "1"
+
+# Heartbeat to prove it is alive even when no games
+HEARTBEAT_MIN = int(os.getenv("HEARTBEAT_MIN", "30"))
+
+# Scan speed
+SCAN_SEC = int(os.getenv("SCAN_SEC", "60"))
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "15"))
+MAX_SLUGS_PER_LEAGUE = int(os.getenv("MAX_SLUGS_PER_LEAGUE", "80"))
+
+# Bankroll sizing (set your bankroll here)
+BANKROLL_USD = float(os.getenv("BANKROLL_USD", "0"))  # set 39 if you want your personal sizing
+
+# =========================
+# Market sources
+# =========================
 CBB_PAGE = "https://polymarket.com/sports/cbb/games"
 NBA_PAGE = "https://polymarket.com/sports/nba/games"
 
-# Polymarket APIs
 SPORTS_WS_URL = "wss://sports-api.polymarket.com/ws"
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 
-# =========================================================
-# HARD DEFAULTS (you can override via env vars if you want)
-# =========================================================
-SCAN_SEC = int(os.getenv("SCAN_SEC", "60"))
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "15"))
-MAX_SLUGS_PER_LEAGUE = int(os.getenv("MAX_SLUGS_PER_LEAGUE", "60"))
+USER_AGENT = os.getenv(
+    "USER_AGENT",
+    "Mozilla/5.0 (compatible; PolymarketEdgeBot/1.1; +https://polymarket.com)",
+)
+HEADERS = {"User-Agent": USER_AGENT}
 
-# Separate tuning per league
+STATE_PATH = os.getenv("STATE_PATH", "state.json")
+
+# =========================
+# League tuning (separate)
+# =========================
 LEAGUE_CFG = {
     "CBB": {
         "slug_prefix": "cbb-",
         "min_snaps": int(os.getenv("CBB_MIN_SNAPS", "12")),
-        "min_move": float(os.getenv("CBB_MIN_MOVE", "0.05")),  # 5c move
+        "min_move": float(os.getenv("CBB_MIN_MOVE", "0.05")),  # 5c
         "live_cooldown": int(os.getenv("CBB_LIVE_COOLDOWN_SEC", "600")),
         "pregame_cooldown": int(os.getenv("CBB_PREGAME_COOLDOWN_SEC", "900")),
-        "min_liquidity": float(os.getenv("CBB_MIN_LIQUIDITY", "2500")),  # optional filter
-        "max_spread_cents": float(os.getenv("CBB_MAX_SPREAD_CENTS", "4.0")),  # optional filter
+        "min_liquidity": float(os.getenv("CBB_MIN_LIQUIDITY", "2500")),
+        "max_spread_cents": float(os.getenv("CBB_MAX_SPREAD_CENTS", "5.0")),
+        "pregame_big_move": float(os.getenv("CBB_PREGAME_BIG_MOVE", "0.06")),  # 6c over snaps window
+        "opening_scout_minutes": int(os.getenv("CBB_OPENING_SCOUT_MIN", "90")),  # treat first 90 min as "opening window"
     },
     "NBA": {
         "slug_prefix": "nba-",
         "min_snaps": int(os.getenv("NBA_MIN_SNAPS", "10")),
-        "min_move": float(os.getenv("NBA_MIN_MOVE", "0.04")),  # 4c move
+        "min_move": float(os.getenv("NBA_MIN_MOVE", "0.04")),  # 4c
         "live_cooldown": int(os.getenv("NBA_LIVE_COOLDOWN_SEC", "480")),
         "pregame_cooldown": int(os.getenv("NBA_PREGAME_COOLDOWN_SEC", "900")),
         "min_liquidity": float(os.getenv("NBA_MIN_LIQUIDITY", "4000")),
-        "max_spread_cents": float(os.getenv("NBA_MAX_SPREAD_CENTS", "4.0")),
+        "max_spread_cents": float(os.getenv("NBA_MAX_SPREAD_CENTS", "5.0")),
+        "pregame_big_move": float(os.getenv("NBA_PREGAME_BIG_MOVE", "0.05")),  # 5c over snaps window
+        "opening_scout_minutes": int(os.getenv("NBA_OPENING_SCOUT_MIN", "90")),
     },
 }
 
-# Exit management (cent based)
+# =========================
+# Guardrails + exits
+# =========================
+MIN_PRICE = float(os.getenv("MIN_PRICE", "0.05"))
+MAX_PRICE = float(os.getenv("MAX_PRICE", "0.95"))
+
 TP1_CENTS = float(os.getenv("TP1_CENTS", "3"))
 TP2_CENTS = float(os.getenv("TP2_CENTS", "6"))
 SL_CENTS = float(os.getenv("SL_CENTS", "2"))
+
 TRAIL_START_CENTS = float(os.getenv("TRAIL_START_CENTS", "4"))
 TRAIL_GAP_CENTS = float(os.getenv("TRAIL_GAP_CENTS", "2"))
 TIME_STOP_MIN = float(os.getenv("TIME_STOP_MIN", "20"))
 
-# Guardrails
-MIN_PRICE = float(os.getenv("MIN_PRICE", "0.05"))
-MAX_PRICE = float(os.getenv("MAX_PRICE", "0.95"))
+# Daily recap
+RECAP_HOUR_LOCAL = int(os.getenv("RECAP_HOUR_LOCAL", "23"))  # 11pm local default
+RECAP_MIN_LOCAL = int(os.getenv("RECAP_MIN_LOCAL", "59"))
 
-STATE_PATH = os.getenv("STATE_PATH", "state.json")
+# =========================
+# Utilities
+# =========================
+MARKET_PARAM_RE = re.compile(r"market=([a-z0-9\-]+)", re.IGNORECASE)
 
-USER_AGENT = os.getenv(
-    "USER_AGENT",
-    "Mozilla/5.0 (compatible; PolymarketEdgeBot/1.0; +https://polymarket.com)",
-)
-HEADERS = {"User-Agent": USER_AGENT}
+def now_ts() -> int:
+    return int(time.time())
 
-# =========================================================
-# State
-# =========================================================
-def load_state() -> Dict[str, Any]:
-    if not os.path.exists(STATE_PATH):
-        return {
-            "history": {},        # key -> [ {"t":ts,"p":price} ]
-            "cooldowns": {},      # key -> last_ts
-            "positions": {},      # key -> { "entry":p, "opened":ts, "peak":p }
-            "last_slugs": {"CBB": [], "NBA": []},
-        }
+def pct(x: float) -> float:
+    return x * 100.0
+
+def cents_diff(now_p: float, old_p: float) -> float:
+    return (now_p - old_p) * 100.0
+
+def safe_float(x: Any) -> Optional[float]:
     try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            s = json.load(f)
-        if not isinstance(s, dict):
-            raise ValueError("bad state")
-        s.setdefault("history", {})
-        s.setdefault("cooldowns", {})
-        s.setdefault("positions", {})
-        s.setdefault("last_slugs", {"CBB": [], "NBA": []})
-        s["last_slugs"].setdefault("CBB", [])
-        s["last_slugs"].setdefault("NBA", [])
-        return s
+        return float(x)
     except Exception:
-        return {
-            "history": {},
-            "cooldowns": {},
-            "positions": {},
-            "last_slugs": {"CBB": [], "NBA": []},
-        }
+        return None
 
-def save_state(state: Dict[str, Any]) -> None:
-    tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f)
-    os.replace(tmp, STATE_PATH)
-
-STATE = load_state()
-
-# =========================================================
-# Notifier
-# =========================================================
 def send_discord(text: str) -> None:
     if not DISCORD_WEBHOOK:
         print("DISCORD_WEBHOOK not set. Message would be:\n", text)
@@ -157,10 +165,70 @@ def notify(text: str) -> None:
     send_discord(text)
     send_telegram(text)
 
-# =========================================================
-# Sports WS (live scores and status)
-# =========================================================
-WS_STATE: Dict[str, Dict[str, Any]] = {}  # slug -> game state
+def prefix_ping() -> str:
+    return "@everyone " if PING_EVERYONE else ""
+
+def market_link(slug: str) -> str:
+    return f"https://polymarket.com/market/{slug}"
+
+# =========================
+# State persistence
+# =========================
+def load_state() -> Dict[str, Any]:
+    if not os.path.exists(STATE_PATH):
+        return {
+            "history": {},            # key -> list of {"t":ts,"p":price}
+            "cooldowns": {},          # key -> last alert ts
+            "positions": {},          # key -> {"entry":p,"opened":ts,"peak":p}
+            "first_seen": {},         # key -> {"ts":ts,"p":price}
+            "alerts_log": [],         # list of alerts for recap
+            "results": {},            # slug -> {"winner": team, "ended_ts": ts}
+            "last_slugs": {"CBB": [], "NBA": []},
+            "last_recap_day": None,   # YYYY-MM-DD
+            "last_heartbeat_ts": 0,
+        }
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            s = json.load(f)
+        if not isinstance(s, dict):
+            raise ValueError("bad state")
+        s.setdefault("history", {})
+        s.setdefault("cooldowns", {})
+        s.setdefault("positions", {})
+        s.setdefault("first_seen", {})
+        s.setdefault("alerts_log", [])
+        s.setdefault("results", {})
+        s.setdefault("last_slugs", {"CBB": [], "NBA": []})
+        s["last_slugs"].setdefault("CBB", [])
+        s["last_slugs"].setdefault("NBA", [])
+        s.setdefault("last_recap_day", None)
+        s.setdefault("last_heartbeat_ts", 0)
+        return s
+    except Exception:
+        return {
+            "history": {},
+            "cooldowns": {},
+            "positions": {},
+            "first_seen": {},
+            "alerts_log": [],
+            "results": {},
+            "last_slugs": {"CBB": [], "NBA": []},
+            "last_recap_day": None,
+            "last_heartbeat_ts": 0,
+        }
+
+def save_state(state: Dict[str, Any]) -> None:
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    os.replace(tmp, STATE_PATH)
+
+STATE = load_state()
+
+# =========================
+# Sports WebSocket (live status, score, ended)
+# =========================
+WS_STATE: Dict[str, Dict[str, Any]] = {}
 WS_LAST_TS: Optional[int] = None
 
 def ws_on_message(ws, message: str):
@@ -179,15 +247,14 @@ def ws_on_message(ws, message: str):
 
     league = str(obj.get("leagueAbbreviation", "")).lower()
     slug = obj.get("slug")
+
     if not isinstance(slug, str):
         return
-
-    # Only keep CBB/NBA
     if league not in ("cbb", "nba"):
         return
 
     WS_STATE[slug] = obj
-    WS_LAST_TS = int(time.time())
+    WS_LAST_TS = now_ts()
 
 def ws_loop():
     def on_open(ws):
@@ -213,14 +280,11 @@ def ws_loop():
             print("WS reconnecting after error:", e)
         time.sleep(3)
 
-# Start WS in background
 threading.Thread(target=ws_loop, daemon=True).start()
 
-# =========================================================
+# =========================
 # Slug discovery
-# =========================================================
-MARKET_PARAM_RE = re.compile(r"market=([a-z0-9\-]+)", re.IGNORECASE)
-
+# =========================
 def scrape_slugs(page_url: str, slug_prefix: str) -> List[str]:
     try:
         r = requests.get(page_url, headers=HEADERS, timeout=HTTP_TIMEOUT)
@@ -236,12 +300,7 @@ def scrape_slugs(page_url: str, slug_prefix: str) -> List[str]:
         if s.lower().startswith(slug_prefix):
             slugs.append(s)
 
-    # Fallback: scan raw tokens
-    if not slugs:
-        for m in re.finditer(rf"\b{re.escape(slug_prefix)}[a-z0-9\-]{{10,}}\b", html, re.IGNORECASE):
-            slugs.append(m.group(0))
-
-    # Dedup preserve order
+    # Dedup preserving order
     seen = set()
     out = []
     for s in slugs:
@@ -252,8 +311,7 @@ def scrape_slugs(page_url: str, slug_prefix: str) -> List[str]:
 
     return out[:MAX_SLUGS_PER_LEAGUE]
 
-def merge_ws_slugs(league: str, slug_prefix: str, base: List[str]) -> List[str]:
-    # Pull slugs from WS_STATE that match prefix
+def merge_ws_slugs(slug_prefix: str, base: List[str]) -> List[str]:
     ws_slugs = [s for s in WS_STATE.keys() if s.lower().startswith(slug_prefix)]
     merged = []
     seen = set()
@@ -264,10 +322,10 @@ def merge_ws_slugs(league: str, slug_prefix: str, base: List[str]) -> List[str]:
         merged.append(s)
     return merged[:MAX_SLUGS_PER_LEAGUE]
 
-# =========================================================
-# Gamma market fetch
-# =========================================================
-def _parse_maybe_json_list(v: Any) -> Any:
+# =========================
+# Gamma market fetch + parse
+# =========================
+def maybe_json_list(v: Any) -> Any:
     if isinstance(v, str) and v.startswith("["):
         try:
             return json.loads(v)
@@ -289,104 +347,106 @@ def fetch_market_by_slug(slug: str) -> Optional[Dict[str, Any]]:
         print("Gamma fetch error:", slug, e)
         return None
 
-def extract_prices(market: Dict[str, Any]) -> List[Dict[str, Any]]:
-    # outcomes and bid/ask arrays can be strings
-    outcomes = _parse_maybe_json_list(market.get("outcomes")) or []
-    best_ask = _parse_maybe_json_list(market.get("bestAsk"))
-    best_bid = _parse_maybe_json_list(market.get("bestBid"))
-    outcome_prices = _parse_maybe_json_list(market.get("outcomePrices"))
-    liq = float(market.get("liquidity") or 0.0)
-    vol = float(market.get("volume") or market.get("volume24hr") or 0.0)
+def extract_outcomes(market: Dict[str, Any]) -> List[Dict[str, Any]]:
+    outcomes = maybe_json_list(market.get("outcomes")) or []
+    best_ask = maybe_json_list(market.get("bestAsk"))
+    best_bid = maybe_json_list(market.get("bestBid"))
+    outcome_prices = maybe_json_list(market.get("outcomePrices"))
+
+    liq = safe_float(market.get("liquidity")) or 0.0
+    vol = safe_float(market.get("volume")) or safe_float(market.get("volume24hr")) or 0.0
     liquidity = liq if liq > 0 else vol
 
     packs: List[Dict[str, Any]] = []
-    if isinstance(outcomes, list) and len(outcomes) >= 2:
-        for i, name in enumerate(outcomes):
-            team = str(name)
-            low = team.strip().lower()
-            if low in ("yes", "no"):
-                continue
+    if not isinstance(outcomes, list) or len(outcomes) < 2:
+        return packs
 
-            ask = None
-            bid = None
-            mid = None
+    for i, name in enumerate(outcomes):
+        team = str(name).strip()
+        if team.lower() in ("yes", "no"):
+            continue
 
-            if isinstance(best_ask, list) and i < len(best_ask):
-                try:
-                    ask = float(best_ask[i])
-                except Exception:
-                    ask = None
-            if isinstance(best_bid, list) and i < len(best_bid):
-                try:
-                    bid = float(best_bid[i])
-                except Exception:
-                    bid = None
+        ask = None
+        bid = None
+        mid = None
 
-            if ask is None and bid is None and isinstance(outcome_prices, list) and i < len(outcome_prices):
-                try:
-                    mid = float(outcome_prices[i])
-                except Exception:
-                    mid = None
+        if isinstance(best_ask, list) and i < len(best_ask):
+            ask = safe_float(best_ask[i])
+        if isinstance(best_bid, list) and i < len(best_bid):
+            bid = safe_float(best_bid[i])
 
-            if mid is None:
-                if ask is not None and bid is not None:
-                    mid = (ask + bid) / 2.0
-                else:
-                    mid = ask if ask is not None else bid
+        if ask is None and bid is None and isinstance(outcome_prices, list) and i < len(outcome_prices):
+            mid = safe_float(outcome_prices[i])
 
-            if mid is None:
-                continue
-
-            spread_c = None
+        if mid is None:
             if ask is not None and bid is not None:
-                spread_c = (ask - bid) * 100.0
+                mid = (ask + bid) / 2.0
+            else:
+                mid = ask if ask is not None else bid
 
-            packs.append(
-                {
-                    "team": team,
-                    "ask": ask,
-                    "bid": bid,
-                    "mid": mid,
-                    "spread_c": spread_c,
-                    "liquidity": liquidity,
-                }
-            )
+        if mid is None:
+            continue
+
+        spread_c = None
+        if ask is not None and bid is not None:
+            spread_c = (ask - bid) * 100.0
+
+        packs.append(
+            {
+                "team": team,
+                "mid": float(mid),
+                "ask": ask,
+                "bid": bid,
+                "spread_c": spread_c,
+                "liquidity": float(liquidity),
+            }
+        )
+
     return packs
 
-# =========================================================
-# Signal + trade management
-# =========================================================
-def hist_key(league: str, slug: str, team: str) -> str:
+# =========================
+# Signal + risk logic
+# =========================
+def key_for(league: str, slug: str, team: str) -> str:
     return f"{league}|{slug}|{team}".lower()
 
 def push_history(key: str, price: float) -> None:
     h = STATE["history"].setdefault(key, [])
-    h.append({"t": int(time.time()), "p": float(price)})
-    if len(h) > 200:
-        del h[:-200]
+    h.append({"t": now_ts(), "p": float(price)})
+    if len(h) > 250:
+        del h[:-250]
 
-def get_prev_price(key: str) -> Optional[float]:
+def hist_len(key: str) -> int:
+    return len(STATE["history"].get(key) or [])
+
+def prev_price(key: str) -> Optional[float]:
     h = STATE["history"].get(key) or []
     if len(h) < 2:
         return None
     return float(h[-2]["p"])
 
-def snaps_ready(league: str, key: str) -> bool:
-    h = STATE["history"].get(key) or []
+def price_over_snaps(league: str, key: str) -> Optional[Tuple[float, float]]:
     need = LEAGUE_CFG[league]["min_snaps"]
-    return len(h) >= need
-
-def move_over_snaps(league: str, key: str) -> Optional[float]:
     h = STATE["history"].get(key) or []
-    need = LEAGUE_CFG[league]["min_snaps"]
     if len(h) < need:
         return None
-    a = float(h[-need]["p"])
-    b = float(h[-1]["p"])
-    return b - a
+    old_p = float(h[-need]["p"])
+    now_p = float(h[-1]["p"])
+    return old_p, now_p
 
-def can_send(league: str, key: str, is_live: bool) -> bool:
-    now = int(time.time())
+def in_guardrails(p: float) -> bool:
+    return MIN_PRICE <= p <= MAX_PRICE
+
+def late_game_ok(ws: Optional[Dict[str, Any]]) -> bool:
+    if not LIVE_LATE_GAME_ONLY:
+        return True
+    if not ws:
+        return False
+    period = str(ws.get("period") or "")
+    return period in ("2H", "4Q", "OT", "FT OT")
+
+def cooldown_ok(league: str, key: str, is_live: bool) -> bool:
+    now = now_ts()
     last = int(STATE["cooldowns"].get(key, 0))
     cd = LEAGUE_CFG[league]["live_cooldown"] if is_live else LEAGUE_CFG[league]["pregame_cooldown"]
     if now - last < cd:
@@ -394,147 +454,312 @@ def can_send(league: str, key: str, is_live: bool) -> bool:
     STATE["cooldowns"][key] = now
     return True
 
-def confidence(move: float, liquidity: float, league: str) -> float:
-    base = 5.0
-    # bigger move = higher
-    base += min(3.0, abs(move) * 50.0)  # 0.05 => +2.5
-    # higher liquidity = higher
-    if liquidity >= 10000:
+def confidence_score(league: str, move: float, liquidity: float, spread_c: Optional[float], is_live: bool) -> float:
+    # 1-10 score based on: move magnitude, liquidity, spread tightness, live/pregame
+    base = 4.5
+    base += min(3.0, abs(move) * 50.0)  # 0.05 -> +2.5
+    if liquidity >= 15000:
         base += 1.5
-    elif liquidity >= 5000:
+    elif liquidity >= 8000:
         base += 1.0
+    elif liquidity >= 4000:
+        base += 0.6
     elif liquidity >= 2500:
+        base += 0.3
+
+    if spread_c is not None:
+        if spread_c <= 2.0:
+            base += 0.8
+        elif spread_c <= 4.0:
+            base += 0.4
+        elif spread_c >= 8.0:
+            base -= 0.8
+
+    if is_live:
         base += 0.5
-    # slight bump NBA
+
     if league == "NBA":
-        base += 0.5
+        base += 0.3
+
     return max(1.0, min(10.0, base))
 
-def should_alert(league: str, price_now: float, price_prev: float) -> bool:
-    if price_now < MIN_PRICE or price_now > MAX_PRICE:
-        return False
-    mv = abs(price_now - price_prev)
-    return mv >= LEAGUE_CFG[league]["min_move"]
+def kelly_sizing(conf: float) -> float:
+    # Practical sizing: converts confidence to % bankroll
+    # Conf 6 => ~1%, Conf 8 => ~2.5%, Conf 9.5 => ~3.5%
+    x = max(0.0, conf - 5.5)
+    pct_bankroll = min(0.04, (x / 4.0) * 0.035)  # cap 4%
+    return pct_bankroll
 
-def pos_get(key: str) -> Optional[Dict[str, Any]]:
-    return STATE["positions"].get(key)
-
-def pos_open(key: str, entry: float) -> None:
+def maybe_open_position(key: str, entry_price: float) -> None:
+    if key in STATE["positions"]:
+        return
     STATE["positions"][key] = {
-        "entry": float(entry),
-        "opened": int(time.time()),
-        "peak": float(entry),
+        "entry": float(entry_price),
+        "opened": now_ts(),
+        "peak": float(entry_price),
     }
 
-def pos_update_peak(key: str, price_now: float) -> None:
-    p = pos_get(key)
+def update_peak(key: str, price_now: float) -> None:
+    p = STATE["positions"].get(key)
     if not p:
         return
-    if price_now > float(p.get("peak", price_now)):
+    peak = float(p.get("peak", price_now))
+    if price_now > peak:
         p["peak"] = float(price_now)
 
-def pos_close(key: str) -> None:
+def close_position(key: str) -> None:
     if key in STATE["positions"]:
         del STATE["positions"][key]
 
 def exit_signal(key: str, price_now: float) -> Optional[Tuple[str, str]]:
-    """
-    Returns (action, reason) or None
-    action in: TP1, TP2, SL, TRAIL, TIME
-    """
-    p = pos_get(key)
+    p = STATE["positions"].get(key)
     if not p:
         return None
 
     entry = float(p["entry"])
+    opened = int(p["opened"])
     peak = float(p.get("peak", entry))
-    opened = int(p.get("opened", int(time.time())))
 
-    pnl_c = (price_now - entry) * 100.0
+    pnl_c = cents_diff(price_now, entry)
 
-    # TP2
     if pnl_c >= TP2_CENTS:
-        return ("TP2", f"TP2 hit (+{pnl_c:.1f}c)")
-
-    # TP1
+        return ("TP2", f"TP2 hit (+{pnl_c:.1f}c). Consider scaling out heavy.")
     if pnl_c >= TP1_CENTS:
-        return ("TP1", f"TP1 hit (+{pnl_c:.1f}c)")
-
-    # SL
+        return ("TP1", f"TP1 hit (+{pnl_c:.1f}c). Consider scaling out partial.")
     if pnl_c <= -SL_CENTS:
-        return ("SL", f"Stop hit ({pnl_c:.1f}c)")
+        return ("SL", f"Stop hit ({pnl_c:.1f}c). Consider cutting risk.")
 
-    # Trailing (activate after trail start)
-    gain_from_entry_c = (peak - entry) * 100.0
+    # Trailing stop after trail start
+    gain_from_entry_c = cents_diff(peak, entry)
     if gain_from_entry_c >= TRAIL_START_CENTS:
         trail_floor = peak - (TRAIL_GAP_CENTS / 100.0)
         if price_now <= trail_floor:
-            return ("TRAIL", "Trailing stop hit")
+            return ("TRAIL", "Trailing stop hit. Protect profits.")
 
-    # Time stop
-    age_min = (int(time.time()) - opened) / 60.0
+    age_min = (now_ts() - opened) / 60.0
     if age_min >= TIME_STOP_MIN and pnl_c < (TP1_CENTS * 0.5):
-        return ("TIME", f"Time stop ({age_min:.0f}m)")
+        return ("TIME", f"Time stop ({age_min:.0f}m). Capital efficiency exit.")
 
     return None
 
-# =========================================================
-# Message formatting
-# =========================================================
-def market_link(slug: str) -> str:
-    return f"https://polymarket.com/market/{slug}"
+# =========================
+# Winner inference + grading
+# =========================
+def infer_winner_from_ws(ws: Dict[str, Any]) -> Optional[str]:
+    # WS provides score as "away-home" (example shows "3-16" with awayTeam/homeTeam)
+    score = str(ws.get("score") or "")
+    away = ws.get("awayTeam")
+    home = ws.get("homeTeam")
+    if not score or "-" not in score or not away or not home:
+        return None
+    try:
+        a_str, h_str = score.split("-", 1)
+        a = int(a_str.strip())
+        h = int(h_str.strip())
+        if a > h:
+            return str(away)
+        if h > a:
+            return str(home)
+        return None
+    except Exception:
+        return None
 
-def fmt_price(p: float) -> str:
-    return f"{p:.2f}"
+def log_alert(kind: str, league: str, slug: str, team: str, price: float, conf: float, is_live: bool, reason: str) -> None:
+    STATE["alerts_log"].append(
+        {
+            "ts": now_ts(),
+            "kind": kind,  # "ENTRY" or "PREGAME_SCOUT" or "UPDATE"
+            "league": league,
+            "slug": slug,
+            "team": team,
+            "price": float(price),
+            "conf": float(conf),
+            "is_live": bool(is_live),
+            "reason": reason,
+        }
+    )
+    # Keep log bounded
+    if len(STATE["alerts_log"]) > 2000:
+        STATE["alerts_log"] = STATE["alerts_log"][-1500:]
 
-def entry_msg(league: str, slug: str, team: str, price: float, mv: float, liq: float, ws: Optional[Dict[str, Any]]) -> str:
+# =========================
+# Message builders
+# =========================
+def entry_message(kind: str, league: str, slug: str, team: str, price: float, move: float, liquidity: float, spread_c: Optional[float], ws: Optional[Dict[str, Any]], conf: float) -> str:
     is_live = bool(ws and ws.get("live"))
-    status = "LIVE" if is_live else "UPCOMING"
-    score = (ws.get("score") if ws else "") or ""
-    period = (ws.get("period") if ws else "") or ""
-    elapsed = (ws.get("elapsed") if ws else "") or ""
+    status = "LIVE" if is_live else "PREGAME"
+    period = (str(ws.get("period")) if ws else "").strip()
+    score = (str(ws.get("score")) if ws else "").strip()
+    elapsed = (str(ws.get("elapsed")) if ws else "").strip()
+
+    move_c = move * 100.0
+    move_emoji = "📈" if move > 0 else "📉"
+    spread_txt = f"{spread_c:.1f}c" if spread_c is not None else "n/a"
+
+    sizing_txt = ""
+    if BANKROLL_USD > 0:
+        frac = kelly_sizing(conf)
+        stake = max(0.0, BANKROLL_USD * frac)
+        sizing_txt = f"\n💵 Sizing: ~{frac*100:.1f}% bankroll ≈ ${stake:.2f} (set by BANKROLL_USD)"
+
     ctx = ""
-    if score or period:
+    if is_live and (period or score):
         ctx = f"\n⏱️ {period} {elapsed} | 🧾 {score}".strip()
 
-    conf = confidence(mv, liq, league)
-    move_c = mv * 100.0
-    move_emoji = "📈" if mv > 0 else "📉"
-
     return (
-        f"@everyone 🚨 {BOT_NAME} {league} {status} BET\n"
-        f"🏀 {team}  💰 {fmt_price(price)}\n"
-        f"{move_emoji} Move: {move_c:+.1f}c | 💧Liq: {int(liq):,} | 🧠 Conf: {conf:.1f}/10"
+        f"{prefix_ping()}🚨 {BOT_NAME} {league} {status} {kind}\n"
+        f"🏀 {team}  💰 {price:.2f}\n"
+        f"{move_emoji} Move: {move_c:+.1f}c | 💧Liq: {int(liquidity):,} | ↔️ Spread: {spread_txt}\n"
+        f"🧠 Confidence: {conf:.1f}/10"
+        f"{sizing_txt}"
         f"{ctx}\n"
         f"🔗 {market_link(slug)}"
     )
 
-def update_msg(league: str, slug: str, team: str, entry: float, nowp: float, action: str, reason: str) -> str:
-    pnl_c = (nowp - entry) * 100.0
+def update_message(league: str, slug: str, team: str, entry: float, nowp: float, action: str, reason: str) -> str:
+    pnl_c = cents_diff(nowp, entry)
     emoji = "✅" if pnl_c >= 0 else "⚠️"
     return (
-        f"@everyone {emoji} {BOT_NAME} {league} UPDATE\n"
+        f"{prefix_ping()}{emoji} {BOT_NAME} {league} SCALE UPDATE\n"
         f"🏀 {team}\n"
         f"Entry: {entry*100:.0f}c | Now: {nowp*100:.0f}c | PnL: {pnl_c:+.1f}c\n"
         f"Action: {action} | {reason}\n"
         f"🔗 {market_link(slug)}"
     )
 
-# =========================================================
+# =========================
+# Pregame scout logic
+# =========================
+def is_opening_window(key: str, league: str) -> bool:
+    fs = STATE["first_seen"].get(key)
+    if not fs:
+        return True
+    minutes = (now_ts() - int(fs["ts"])) / 60.0
+    return minutes <= float(LEAGUE_CFG[league]["opening_scout_minutes"])
+
+def record_first_seen(key: str, price: float) -> None:
+    if key in STATE["first_seen"]:
+        return
+    STATE["first_seen"][key] = {"ts": now_ts(), "p": float(price)}
+
+def opening_scout_signal(league: str, key: str, price_now: float) -> Optional[Tuple[str, float]]:
+    """
+    "Opening scalp" idea:
+    If a market just appeared (opening window) and price moved quickly from first_seen,
+    it can indicate early imbalance.
+    """
+    fs = STATE["first_seen"].get(key)
+    if not fs:
+        return None
+    p0 = float(fs["p"])
+    move = price_now - p0
+    # require meaningful move during opening window
+    thresh = float(LEAGUE_CFG[league]["pregame_big_move"])  # 0.05-0.06 type
+    if abs(move) >= thresh and is_opening_window(key, league):
+        return ("OPENING_SCALP", move)
+    return None
+
+def pregame_big_move_signal(league: str, key: str) -> Optional[float]:
+    """
+    Pregame "scan ahead":
+    If price has moved a lot over snaps window before game is live, flag it.
+    """
+    pair = price_over_snaps(league, key)
+    if not pair:
+        return None
+    old_p, now_p = pair
+    move = now_p - old_p
+    if abs(move) >= float(LEAGUE_CFG[league]["pregame_big_move"]):
+        return move
+    return None
+
+# =========================
+# Daily recap
+# =========================
+def local_day_str() -> str:
+    # uses server local time. Railway is often UTC. That is fine for a daily recap.
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+def local_hm() -> Tuple[int, int]:
+    lt = time.localtime()
+    return lt.tm_hour, lt.tm_min
+
+def run_daily_recap_if_time() -> None:
+    day = local_day_str()
+    hour, minute = local_hm()
+
+    if STATE.get("last_recap_day") == day:
+        return
+
+    if hour != RECAP_HOUR_LOCAL or minute != RECAP_MIN_LOCAL:
+        return
+
+    # Build recap from alerts_log and results
+    since_ts = now_ts() - 24 * 3600
+    alerts = [a for a in STATE["alerts_log"] if int(a["ts"]) >= since_ts and a.get("kind") in ("ENTRY", "PREGAME_SCOUT")]
+    if not alerts:
+        notify(f"📊 {BOT_NAME} Daily Recap\nNo alerts in the last 24h.")
+        STATE["last_recap_day"] = day
+        return
+
+    # Grade only those slugs with results known
+    wins = 0
+    losses = 0
+    graded = 0
+
+    by_league = {"CBB": 0, "NBA": 0}
+    for a in alerts:
+        by_league[a["league"]] = by_league.get(a["league"], 0) + 1
+        slug = a["slug"]
+        res = STATE["results"].get(slug)
+        if not res:
+            continue
+        winner = res.get("winner")
+        if not winner:
+            continue
+        graded += 1
+        if str(a["team"]) == str(winner):
+            wins += 1
+        else:
+            losses += 1
+
+    hit_rate = (wins / graded * 100.0) if graded > 0 else 0.0
+
+    msg = (
+        f"📊 {BOT_NAME} Daily Recap\n"
+        f"Alerts: {len(alerts)} | CBB: {by_league.get('CBB', 0)} | NBA: {by_league.get('NBA', 0)}\n"
+        f"Graded: {graded} | Wins: {wins} | Losses: {losses} | Hit Rate: {hit_rate:.1f}%\n"
+        f"Notes: Grading only counts games where Polymarket WS provided a final result."
+    )
+    notify(msg)
+    STATE["last_recap_day"] = day
+
+# =========================
 # Main loop
-# =========================================================
+# =========================
 def main():
     notify(f"🟣 {BOT_NAME} is ONLINE ✅ | Watching CBB + NBA")
 
-    last_heartbeat = 0
-
     while True:
         try:
-            # Discover slugs for each league
+            # Heartbeat
+            if HEARTBEAT_MIN > 0:
+                if now_ts() - int(STATE.get("last_heartbeat_ts", 0)) >= HEARTBEAT_MIN * 60:
+                    STATE["last_heartbeat_ts"] = now_ts()
+                    notify(
+                        f"🟣 {BOT_NAME} heartbeat ✅ | "
+                        f"CBB slugs={len(STATE['last_slugs'].get('CBB', []))} | "
+                        f"NBA slugs={len(STATE['last_slugs'].get('NBA', []))} | "
+                        f"WS={WS_LAST_TS}"
+                    )
+
+            # Daily recap check
+            run_daily_recap_if_time()
+
+            # Discover slugs
             cbb_slugs = scrape_slugs(CBB_PAGE, LEAGUE_CFG["CBB"]["slug_prefix"])
             nba_slugs = scrape_slugs(NBA_PAGE, LEAGUE_CFG["NBA"]["slug_prefix"])
 
-            # fallback to last if scrape fails
             if cbb_slugs:
                 STATE["last_slugs"]["CBB"] = cbb_slugs
             else:
@@ -545,88 +770,174 @@ def main():
             else:
                 nba_slugs = STATE["last_slugs"]["NBA"]
 
-            # merge WS discovered slugs too
-            cbb_slugs = merge_ws_slugs("CBB", LEAGUE_CFG["CBB"]["slug_prefix"], cbb_slugs)
-            nba_slugs = merge_ws_slugs("NBA", LEAGUE_CFG["NBA"]["slug_prefix"], nba_slugs)
-
-            # heartbeat every 30 min
-            now = time.time()
-            if now - last_heartbeat >= 1800:
-                last_heartbeat = now
-                notify(f"🟣 {BOT_NAME} heartbeat ✅ | CBB slugs={len(cbb_slugs)} | NBA slugs={len(nba_slugs)} | WS={WS_LAST_TS}")
+            # Merge in WS-discovered slugs
+            cbb_slugs = merge_ws_slugs(LEAGUE_CFG["CBB"]["slug_prefix"], cbb_slugs)
+            nba_slugs = merge_ws_slugs(LEAGUE_CFG["NBA"]["slug_prefix"], nba_slugs)
 
             totals = {"CBB": 0, "NBA": 0}
-            alerts = 0
-            updates = 0
+            alerts_sent = 0
+            updates_sent = 0
 
             for league, slugs in (("CBB", cbb_slugs), ("NBA", nba_slugs)):
+                cfg = LEAGUE_CFG[league]
                 for slug in slugs:
                     ws = WS_STATE.get(slug)
-                    if ws and bool(ws.get("ended")):
+                    is_live = bool(ws and ws.get("live"))
+                    ended = bool(ws and ws.get("ended"))
+
+                    # Store results when ended
+                    if ended and ws:
+                        winner = infer_winner_from_ws(ws)
+                        if winner:
+                            STATE["results"][slug] = {"winner": winner, "ended_ts": now_ts()}
+
+                    # Alert type filters
+                    if is_live and not ENABLE_LIVE_ALERTS:
+                        continue
+                    if (not is_live) and not ENABLE_PREGAME_ALERTS:
+                        continue
+
+                    # Late game only filter (live)
+                    if is_live and not late_game_ok(ws):
                         continue
 
                     market = fetch_market_by_slug(slug)
                     if not market:
                         continue
 
-                    packs = extract_prices(market)
-                    if not packs:
+                    outcomes = extract_outcomes(market)
+                    if not outcomes:
                         continue
 
-                    for p in packs:
-                        team = p["team"]
-                        mid = float(p["mid"])
-                        liq = float(p["liquidity"] or 0.0)
-                        spread_c = p.get("spread_c")
+                    for o in outcomes:
+                        team = o["team"]
+                        mid = float(o["mid"])
+                        liquidity = float(o["liquidity"])
+                        spread_c = o.get("spread_c")
 
-                        # Optional filters: liquidity and spread
-                        if liq < float(LEAGUE_CFG[league]["min_liquidity"]):
+                        if not in_guardrails(mid):
                             continue
-                        if spread_c is not None and float(spread_c) > float(LEAGUE_CFG[league]["max_spread_cents"]):
+
+                        # Liquidity + spread filters
+                        if liquidity < float(cfg["min_liquidity"]):
+                            continue
+                        if spread_c is not None and float(spread_c) > float(cfg["max_spread_cents"]):
                             continue
 
                         totals[league] += 1
+                        k = key_for(league, slug, team)
 
-                        key = hist_key(league, slug, team)
+                        # first seen
+                        record_first_seen(k, mid)
 
-                        push_history(key, mid)
-                        prev = get_prev_price(key)
-                        if prev is None:
+                        # history
+                        push_history(k, mid)
+
+                        # need previous
+                        pprev = prev_price(k)
+                        if pprev is None:
                             continue
 
-                        # Warmup check
-                        if not snaps_ready(league, key):
+                        # warmup
+                        if hist_len(k) < int(cfg["min_snaps"]):
                             continue
 
-                        # Move over snaps window
-                        mv = move_over_snaps(league, key)
-                        if mv is None:
+                        # move over snaps window
+                        pair = price_over_snaps(league, k)
+                        if not pair:
                             continue
+                        old_p, now_p = pair
+                        move = now_p - old_p
 
-                        is_live = bool(ws and ws.get("live"))
+                        # --- Pregame "scan ahead" ---
+                        if not is_live and ENABLE_PREGAME_ALERTS:
+                            # Opening scalp signal (from first_seen)
+                            op = opening_scout_signal(league, k, mid)
+                            if op:
+                                kind, move_open = op
+                                conf = confidence_score(league, move_open, liquidity, spread_c, is_live=False)
+                                if cooldown_ok(league, k + "|PREGAME_OPEN", is_live=False):
+                                    msg = entry_message(
+                                        kind="PREGAME SCOUT (Opening)",
+                                        league=league,
+                                        slug=slug,
+                                        team=team,
+                                        price=mid,
+                                        move=move_open,
+                                        liquidity=liquidity,
+                                        spread_c=spread_c,
+                                        ws=None,
+                                        conf=conf,
+                                    )
+                                    notify(msg)
+                                    log_alert("PREGAME_SCOUT", league, slug, team, mid, conf, False, "opening-scout")
+                                    alerts_sent += 1
 
-                        # Entry alert
-                        if should_alert(league, mid, prev) and can_send(league, key, is_live):
-                            notify(entry_msg(league, slug, team, mid, mv, liq, ws))
-                            alerts += 1
-                            pos_open(key, mid)
+                            # Big move over snaps window pregame
+                            big_mv = pregame_big_move_signal(league, k)
+                            if big_mv is not None:
+                                conf = confidence_score(league, big_mv, liquidity, spread_c, is_live=False)
+                                if cooldown_ok(league, k + "|PREGAME_BIG", is_live=False):
+                                    msg = entry_message(
+                                        kind="PREGAME SCOUT (Momentum)",
+                                        league=league,
+                                        slug=slug,
+                                        team=team,
+                                        price=mid,
+                                        move=big_mv,
+                                        liquidity=liquidity,
+                                        spread_c=spread_c,
+                                        ws=None,
+                                        conf=conf,
+                                    )
+                                    notify(msg)
+                                    log_alert("PREGAME_SCOUT", league, slug, team, mid, conf, False, "pregame-momentum")
+                                    alerts_sent += 1
 
-                        # Update peak and manage exits
-                        if pos_get(key):
-                            pos_update_peak(key, mid)
-                            sig = exit_signal(key, mid)
+                        # --- Live/Pregame entry alerts (price displacement) ---
+                        # Trigger if the latest move vs previous tick is large enough
+                        tick_move = mid - pprev
+                        if abs(tick_move) >= float(cfg["min_move"]):
+                            conf = confidence_score(league, move, liquidity, spread_c, is_live=is_live)
+                            alert_key = k + ("|LIVE" if is_live else "|PREGAME")
+                            if cooldown_ok(league, alert_key, is_live=is_live):
+                                kind = "LIVE BET" if is_live else "PREGAME BET"
+                                msg = entry_message(
+                                    kind=kind,
+                                    league=league,
+                                    slug=slug,
+                                    team=team,
+                                    price=mid,
+                                    move=move,
+                                    liquidity=liquidity,
+                                    spread_c=spread_c,
+                                    ws=ws if is_live else None,
+                                    conf=conf,
+                                )
+                                notify(msg)
+                                log_alert("ENTRY", league, slug, team, mid, conf, is_live, "displacement")
+                                alerts_sent += 1
+                                maybe_open_position(k, mid)
+
+                        # --- Exit updates for open positions ---
+                        if k in STATE["positions"]:
+                            update_peak(k, mid)
+                            sig = exit_signal(k, mid)
                             if sig:
                                 action, reason = sig
-                                entry = float(STATE["positions"][key]["entry"])
-                                notify(update_msg(league, slug, team, entry, mid, action, reason))
-                                updates += 1
-                                # Close on TP2 / SL / TRAIL / TIME. Keep open on TP1 so it can keep running.
+                                entry = float(STATE["positions"][k]["entry"])
+                                notify(update_message(league, slug, team, entry, mid, action, reason))
+                                log_alert("UPDATE", league, slug, team, mid, 0.0, is_live, f"exit-{action}")
+                                updates_sent += 1
+
+                                # Close position on TP2/SL/TRAIL/TIME. Keep on TP1.
                                 if action in ("TP2", "SL", "TRAIL", "TIME"):
-                                    pos_close(key)
+                                    close_position(k)
 
             save_state(STATE)
             print(
-                f"SCAN ok | CBB outcomes={totals['CBB']} NBA outcomes={totals['NBA']} alerts={alerts} updates={updates} | WS={WS_LAST_TS}"
+                f"SCAN ok | CBB outcomes={totals['CBB']} NBA outcomes={totals['NBA']} "
+                f"alerts={alerts_sent} updates={updates_sent} | WS={WS_LAST_TS}"
             )
             time.sleep(SCAN_SEC)
 
